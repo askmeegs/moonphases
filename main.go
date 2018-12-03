@@ -15,16 +15,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
-	"time"
 
 	_ "github.com/jnewmano/grpc-json-proxy/codec"
 	pb "github.com/m-okeefe/moonphases/proto"
@@ -39,6 +39,7 @@ var (
 	logLevel = flag.String("log-level", "info", "info, debug, warn, error")
 	city     = flag.String("city", "San Francisco, CA", "<City>, <State-Abbrev>")
 	log      *logrus.Entry
+	tr       *http.Transport
 )
 
 type MoonPhasesServer struct {
@@ -77,6 +78,10 @@ type Phase struct {
 }
 
 func init() {
+	tr = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
 	flag.Parse()
 	host, err := os.Hostname()
 	if err != nil {
@@ -120,35 +125,40 @@ func main() {
 // Calls the Naval Observatory API to get moon phase info for a <City> on Today's <Date>
 func (s *MoonPhasesServer) GetPhases(ctx context.Context, req *pb.GetPhasesRequest) (*pb.GetPhasesResponse, error) {
 
-	log.Info("GET")
+	log.Info("GET - calling GCF")
+	var r RawPhases
 
-	// Construct query
-	currentTime := time.Now().Local()
-	f := currentTime.Format("01/7/2006")
-	Url, _ := url.Parse("http://api.usno.navy.mil")
-	Url.Path += "/rstt/oneday"
-	parameters := url.Values{}
-	parameters.Add("date", f)
-	parameters.Add("loc", s.City)
-	Url.RawQuery = parameters.Encode()
-	fmt.Printf("Encoded URL is %q\n", Url.String())
+	type Payload struct {
+		City string `json:"city"`
+	}
 
-	// Call USNO API
-	resp, err := http.Get(Url.String())
+	data := Payload{
+		City: s.City,
+	}
+	payloadBytes, err := json.Marshal(data)
 	if err != nil {
-		log.Error(err)
+		return &pb.GetPhasesResponse{}, err
+	}
+	body := bytes.NewReader(payloadBytes)
+
+	gcfReq, err := http.NewRequest("POST", "https://us-central1-mokeefe-empathy.cloudfunctions.net/usno-moon", body)
+	if err != nil {
+		return &pb.GetPhasesResponse{}, err
+	}
+	gcfReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(gcfReq)
+	if err != nil {
 		return &pb.GetPhasesResponse{}, err
 	}
 	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
 
-	// Unmarshal raw json into RawPhases struct
-	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Error(err)
 		return &pb.GetPhasesResponse{}, err
 	}
-	var r RawPhases
-	err = json.Unmarshal(body, &r)
+
+	err = json.Unmarshal(b, &r)
 	if err != nil {
 		log.Error(err)
 		return &pb.GetPhasesResponse{}, err
